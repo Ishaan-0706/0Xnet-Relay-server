@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: libp2p-relay
+    env: docker
+    dockerfilePath: ./Dockerfile
+    plan: free  # or starter for better performance
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 8080
+      - key: P2P_PORT
+        value: 4001
+      # Save this after first run to keep same peer ID
+      - key: PRIVATE_KEY
+        sync: false
