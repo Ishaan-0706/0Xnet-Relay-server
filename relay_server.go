@@ -45,26 +45,31 @@ type Stats struct {
 }
 
 func main() {
-	// Render HTTP port (8080)
-	httpPort := os.Getenv("PORT")
-	if httpPort == "" {
-		httpPort = "8080"
+	// IMPORTANT: Render maps its public URL to whatever is in os.Getenv("PORT")
+	// We want the LIBP2P RELAY to be on that port.
+	renderPort := os.Getenv("PORT")
+	if renderPort == "" {
+		renderPort = "8080"
 	}
 
-	// libp2p port (MUST be different)
-	p2pPort := "4001"
+	// We'll put the HTTP Stats on a different port. 
+	// (Note: This means the Web UI won't be reachable from the internet on Render, 
+	// but the Relay connection will FINALLY work).
+	internalHttpPort := "9090"
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	server, err := NewRelayServer(ctx, p2pPort)
+	// Start the Relay on the main Render port
+	server, err := NewRelayServer(ctx, renderPort)
 	if err != nil {
 		log.Fatalf("Failed to start relay: %v", err)
 	}
 
-	go startHTTPServer(httpPort, server)
+	// Start HTTP server on a secondary port to avoid conflict
+	go startHTTPServer(internalHttpPort, server)
 
-	printStartupInfo(server, httpPort, p2pPort)
+	printStartupInfo(server, internalHttpPort, renderPort)
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -84,14 +89,14 @@ func NewRelayServer(ctx context.Context, p2pPort string) (*RelayServer, error) {
 	}
 	if privKey == nil {
 		privKey, _, _ = crypto.GenerateEd25519Key(rand.Reader)
+		// Print it so you can save it to Render Env Vars later
+		keyBytes, _ := crypto.MarshalPrivateKey(privKey)
+		fmt.Printf("\n🔑 NEW PRIVATE_KEY (Save this!): %s\n\n", crypto.ConfigEncodeKey(keyBytes))
 	}
 
-	tcpAddr, _ := multiaddr.NewMultiaddr(
-		fmt.Sprintf("/ip4/0.0.0.0/tcp/%s", p2pPort),
-	)
-	wsAddr, _ := multiaddr.NewMultiaddr(
-		fmt.Sprintf("/ip4/0.0.0.0/tcp/%s/ws", p2pPort),
-	)
+	// Listen addresses using the p2pPort (which is the Render $PORT)
+	tcpAddr, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/0.0.0.0/tcp/%s", p2pPort))
+	wsAddr, _ := multiaddr.NewMultiaddr(fmt.Sprintf("/ip4/0.0.0.0/tcp/%s/ws", p2pPort))
 
 	h, err := libp2p.New(
 		libp2p.ListenAddrs(tcpAddr, wsAddr),
@@ -126,11 +131,13 @@ func NewRelayServer(ctx context.Context, p2pPort string) (*RelayServer, error) {
 			server.totalConnections++
 			server.peersConnected[c.RemotePeer()] = time.Now()
 			server.mu.Unlock()
+			fmt.Printf("✅ Peer Connected: %s\n", c.RemotePeer().String())
 		},
 		DisconnectedF: func(n network.Network, c network.Conn) {
 			server.mu.Lock()
 			delete(server.peersConnected, c.RemotePeer())
 			server.mu.Unlock()
+			fmt.Printf("❌ Peer Disconnected: %s\n", c.RemotePeer().String())
 		},
 	})
 
@@ -139,30 +146,25 @@ func NewRelayServer(ctx context.Context, p2pPort string) (*RelayServer, error) {
 
 func startHTTPServer(port string, server *RelayServer) {
 	mux := http.NewServeMux()
-
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "0Xnet Relay Online\nPeerID: %s\n", server.host.ID())
 	})
-
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		json.NewEncoder(w).Encode(map[string]string{
-			"status": "healthy",
-		})
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprint(w, "OK")
 	})
-
 	mux.HandleFunc("/stats", func(w http.ResponseWriter, r *http.Request) {
-		stats := server.GetStats()
-		json.NewEncoder(w).Encode(stats)
+		json.NewEncoder(w).Encode(server.GetStats())
 	})
 
-	log.Printf("HTTP server listening on :%s", port)
-	log.Fatal(http.ListenAndServe(":"+port, mux))
+	log.Printf("Internal HTTP stats running on :%s (Not reachable via Render public URL)", port)
+	// We don't log.Fatal here so if the port is busy, the relay keeps running
+	http.ListenAndServe(":"+port, mux)
 }
 
 func (s *RelayServer) GetStats() Stats {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-
 	stats := Stats{
 		PeerID:           s.host.ID().String(),
 		Uptime:           time.Since(s.startTime).Round(time.Second).String(),
@@ -170,14 +172,9 @@ func (s *RelayServer) GetStats() Stats {
 		ConnectedPeers:   len(s.peersConnected),
 		TotalConnections: s.totalConnections,
 	}
-
 	for _, addr := range s.host.Addrs() {
-		stats.RelayAddresses = append(
-			stats.RelayAddresses,
-			fmt.Sprintf("%s/p2p/%s", addr, s.host.ID()),
-		)
+		stats.RelayAddresses = append(stats.RelayAddresses, fmt.Sprintf("%s/p2p/%s", addr, s.host.ID()))
 	}
-
 	return stats
 }
 
@@ -187,8 +184,7 @@ func (s *RelayServer) Stop() error {
 }
 
 func printStartupInfo(server *RelayServer, httpPort, p2pPort string) {
-	fmt.Println("🚀 0Xnet Relay Started")
+	fmt.Println("🚀 0Xnet Relay Deployment Version")
 	fmt.Println("Peer ID:", server.host.ID())
-	fmt.Println("HTTP Port:", httpPort)
-	fmt.Println("libp2p Port:", p2pPort)
+	fmt.Printf("PUBLIC Relay Port (via Render): %s\n", p2pPort)
 }
